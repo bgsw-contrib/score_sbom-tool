@@ -51,8 +51,12 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.generate_crates_metadata_cache import (
+    _fetch_one_crate_meta,
+    _normalize_license_expression,
+    generate_cache,
     generate_synthetic_cargo_lock,
     parse_dash_summary,
     parse_module_bazel_lock,
@@ -296,6 +300,117 @@ class TestGenerateSyntheticCargoLock(unittest.TestCase):
         a_pos = content.index('name = "a-crate"')
         z_pos = content.index('name = "z-crate"')
         self.assertLess(a_pos, z_pos)
+
+
+class TestCratesIoLicenseFallback(unittest.TestCase):
+    """Tests for crates.io-first metadata behavior in generate_cache()."""
+
+    def _write_module_lock(self, crates: list[tuple[str, str, str]]) -> str:
+        """Create a minimal MODULE.bazel.lock with crate_universe specs.
+
+        Args:
+            crates: List of (name, version, sha256)
+        """
+        specs = {}
+        for name, version, sha256 in crates:
+            specs[f"crate_index__{name}-{version}"] = {"attributes": {"sha256": sha256}}
+
+        lockfile = {
+            "moduleExtensions": {
+                "@@rules_rust+//crate_universe:extensions.bzl%crate": {
+                    "general": {"generatedRepoSpecs": specs}
+                }
+            }
+        }
+
+        fd, path = tempfile.mkstemp(suffix=".lock")
+        with os.fdopen(fd, "w") as f:
+            json.dump(lockfile, f)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_normalize_license_expression_slash_to_or(self):
+        """crates.io slash separator must be normalized to SPDX OR."""
+        self.assertEqual(
+            _normalize_license_expression("MIT/Apache-2.0"),
+            "MIT OR Apache-2.0",
+        )
+
+    @mock.patch(
+        "scripts.generate_crates_metadata_cache.fetch_crate_metadata_from_cratesio"
+    )
+    def test_generate_cache_uses_cratesio_license_when_dash_disabled(self, mock_fetch):
+        """Without dash-license-scan, crates.io license is used as fallback source."""
+        mock_fetch.return_value = {
+            "serde": {
+                "license": "MIT OR Apache-2.0",
+                "description": "Serde framework",
+                "supplier": "serde-rs",
+            }
+        }
+        module_lock = self._write_module_lock([("serde", "1.0.228", "abc123")])
+
+        cache = generate_cache(
+            module_lock_paths=[module_lock], use_dash_license_scan=False
+        )
+
+        self.assertEqual(cache["serde"]["license"], "MIT OR Apache-2.0")
+        self.assertEqual(cache["serde"]["description"], "Serde framework")
+        self.assertEqual(cache["serde"]["supplier"], "serde-rs")
+
+    @mock.patch("scripts.generate_crates_metadata_cache.parse_dash_summary")
+    @mock.patch("scripts.generate_crates_metadata_cache.run_dash_license_scan")
+    @mock.patch(
+        "scripts.generate_crates_metadata_cache.fetch_crate_metadata_from_cratesio"
+    )
+    def test_dash_license_takes_precedence_over_cratesio(
+        self,
+        mock_fetch,
+        _mock_run_dash,
+        mock_parse_dash,
+    ):
+        """When enabled, dash-license-scan license must override crates.io license."""
+        mock_fetch.return_value = {
+            "serde": {
+                "license": "MIT OR Apache-2.0",
+                "description": "Serde framework",
+                "supplier": "serde-rs",
+            }
+        }
+        mock_parse_dash.return_value = {"serde": "Apache-2.0"}
+        module_lock = self._write_module_lock([("serde", "1.0.228", "abc123")])
+
+        cache = generate_cache(
+            module_lock_paths=[module_lock], use_dash_license_scan=True
+        )
+
+        self.assertEqual(cache["serde"]["license"], "Apache-2.0")
+
+    @mock.patch("scripts.generate_crates_metadata_cache._cratesio_get")
+    def test_fetch_one_crate_meta_uses_locked_version_for_license(self, mock_get):
+        """License must come from the locked version, not the crate's latest release.
+
+        The crates.io crate-level endpoint has no license field at all (it only
+        exists on the per-version endpoint), so a crate that changed its license
+        between the locked version and the latest release must still report the
+        locked version's license, not the latest one's.
+        """
+
+        def fake_get(url):
+            if url == "https://crates.io/api/v1/crates/relicensed":
+                return {
+                    "crate": {"description": "A crate", "repository": ""},
+                }
+            if url == "https://crates.io/api/v1/crates/relicensed/1.0.0":
+                return {"version": {"license": "MIT"}}
+            if url == "https://crates.io/api/v1/crates/relicensed/2.0.0":
+                return {"version": {"license": "Apache-2.0"}}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        mock_get.side_effect = fake_get
+
+        name, meta = _fetch_one_crate_meta("relicensed", "1.0.0")
+        self.assertEqual(meta["license"], "MIT")
 
 
 class TestEndToEndLicenseExtraction(unittest.TestCase):
