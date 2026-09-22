@@ -70,10 +70,18 @@ def parse_module_bazel_files(file_paths: list[str]) -> dict[str, dict[str, str]]
         if name_match and version_match:
             name = name_match.group(1)
             version = version_match.group(1)
-            modules[name] = {
+            purl = (
+                f"pkg:github/eclipse-score/{name}@{version}"
+                if name.startswith("score_")
+                else f"pkg:generic/{name}@{version}"
+            )
+            entry: dict[str, str] = {
                 "version": version,
-                "purl": f"pkg:generic/{name}@{version}",
+                "purl": purl,
             }
+            if name.startswith("score_"):
+                entry["url"] = f"https://github.com/eclipse-score/{name}"
+            modules[name] = entry
 
     return modules
 
@@ -81,17 +89,18 @@ def parse_module_bazel_files(file_paths: list[str]) -> dict[str, dict[str, str]]
 def parse_module_lockfiles(file_paths: list[str]) -> dict[str, dict[str, str]]:
     """Parse MODULE.bazel.lock files to infer module versions and checksums.
 
-    Uses registry URL keys from lockfiles. Only modules with a single unique
-    observed version are emitted to avoid ambiguous version selection.
+    Uses registry URL keys from lockfiles. Extracts resolved module versions
+    and SHA-256 checksums from ``source.json`` entries (or falls back to unique
+    ``MODULE.bazel`` candidate entries when source.json is not present).
 
-    For modules coming from the Bazel Central Registry, this also extracts the
-    SHA-256 checksum from the corresponding ``source.json`` entry so that
-    CycloneDX hashes can be populated for C/C++ dependencies.
+    For modules coming from Bazel registries, this extracts the resolved version
+    and the SHA-256 checksum from the corresponding ``source.json`` entry so
+    that CycloneDX hashes and version info are accurately populated.
     """
-    # Track all observed versions per module and (optional) sha256 per
-    # (module, version) tuple.
-    module_versions: dict[str, set[str]] = {}
-    module_sha256: dict[tuple[str, str], str] = {}
+    # Track source.json entries (authoritative resolved versions): module_name -> {version: sha256}
+    module_source_versions: dict[str, dict[str, str]] = {}
+    # Track candidate MODULE.bazel entries (evaluated versions during resolution)
+    module_candidate_versions: dict[str, set[str]] = {}
 
     for fpath in file_paths:
         try:
@@ -108,40 +117,74 @@ def parse_module_lockfiles(file_paths: list[str]) -> dict[str, dict[str, str]]:
             if not isinstance(url, str) or not isinstance(sha, str):
                 continue
 
-            # MODULE.bazel entry – records which version was selected.
-            module_match = re.search(
-                r"/modules/([^/]+)/([^/]+)/MODULE\.bazel$",
-                url,
-            )
-            if module_match:
-                module_name, version = module_match.groups()
-                module_versions.setdefault(module_name, set()).add(version)
-
             # source.json entry – carries the sha256 of the downloaded source
-            # tarball for this module@version. Use it as the component hash.
+            # tarball for this module@version. This indicates the version was
+            # selected and downloaded by Bazel.
             source_match = re.search(
                 r"/modules/([^/]+)/([^/]+)/source\.json$",
                 url,
             )
             if source_match:
                 src_module, src_version = source_match.groups()
-                module_sha256[(src_module, src_version)] = sha
+                module_source_versions.setdefault(src_module, {})[src_version] = sha
+                continue
+
+            # MODULE.bazel entry – candidate version evaluated during resolution.
+            module_match = re.search(
+                r"/modules/([^/]+)/([^/]+)/MODULE\.bazel$",
+                url,
+            )
+            if module_match:
+                module_name, version = module_match.groups()
+                module_candidate_versions.setdefault(module_name, set()).add(version)
 
     modules: dict[str, dict[str, str]] = {}
-    for name, versions in module_versions.items():
-        if len(versions) != 1:
-            # Skip modules with ambiguous versions.
+    all_module_names = set(module_source_versions.keys()) | set(
+        module_candidate_versions.keys()
+    )
+
+    for name in sorted(all_module_names):
+        version = None
+        sha = None
+
+        if name in module_source_versions:
+            src_versions = module_source_versions[name]
+            # If exactly one resolved version has a source.json, that's the selected version
+            if len(src_versions) == 1:
+                version, sha = next(iter(src_versions.items()))
+            else:
+                # Ambiguous source.json versions across lockfiles
+                continue
+        elif name in module_candidate_versions:
+            cand_versions = module_candidate_versions[name]
+            # Fallback for lockfiles without source.json entries (e.g. mock test data)
+            if len(cand_versions) == 1:
+                version = next(iter(cand_versions))
+            else:
+                # Ambiguous candidate versions without source.json
+                continue
+
+        if not version:
             continue
-        version = next(iter(versions))
+
+        purl = (
+            f"pkg:github/eclipse-score/{name}@{version}"
+            if name.startswith("score_")
+            else f"pkg:generic/{name}@{version}"
+        )
+
         entry: dict[str, str] = {
             "version": version,
-            "purl": f"pkg:generic/{name}@{version}",
+            "purl": purl,
         }
-        sha = module_sha256.get((name, version))
         if sha:
             # Expose as sha256 so downstream code can turn it into a CycloneDX
             # SHA-256 hash entry.
             entry["sha256"] = sha
+
+        if name.startswith("score_"):
+            entry["url"] = f"https://github.com/eclipse-score/{name}"
+
         modules[name] = entry
 
     return modules
@@ -204,6 +247,7 @@ BCR_KNOWN_LICENSES: dict[str, dict[str, str]] = {
     "nlohmann-json": {"license": "MIT", "supplier": "Niels Lohmann"},
     "googletest": {"license": "BSD-3-Clause", "supplier": "Google LLC"},
     "google-benchmark": {"license": "Apache-2.0", "supplier": "Google LLC"},
+    "google_benchmark": {"license": "Apache-2.0", "supplier": "Google LLC"},
     "flatbuffers": {"license": "Apache-2.0", "supplier": "Google LLC"},
     "protobuf": {"license": "BSD-3-Clause", "supplier": "Google LLC"},
     "re2": {"license": "BSD-3-Clause", "supplier": "Google LLC"},
@@ -211,18 +255,30 @@ BCR_KNOWN_LICENSES: dict[str, dict[str, str]] = {
     "curl": {"license": "curl", "supplier": "Daniel Stenberg"},
     "libpng": {"license": "libpng", "supplier": "Glenn Randers-Pehrson"},
     "libjpeg": {"license": "IJG", "supplier": "Independent JPEG Group"},
+    "rules_rust": {"license": "Apache-2.0", "supplier": "The Bazel Authors"},
+    "rules_cc": {"license": "Apache-2.0", "supplier": "The Bazel Authors"},
+    "rules_python": {"license": "Apache-2.0", "supplier": "The Bazel Authors"},
+    "bazel_skylib": {"license": "Apache-2.0", "supplier": "The Bazel Authors"},
+    "platforms": {"license": "Apache-2.0", "supplier": "The Bazel Authors"},
+    "aspect_bazel_lib": {"license": "Apache-2.0", "supplier": "Aspect Build Inc"},
+    "aspect_rules_lint": {"license": "Apache-2.0", "supplier": "Aspect Build Inc"},
+    "aspect_rules_js": {"license": "Apache-2.0", "supplier": "Aspect Build Inc"},
+    "aspect_rules_esbuild": {"license": "Apache-2.0", "supplier": "Aspect Build Inc"},
+    "aspect_rules_py": {"license": "Apache-2.0", "supplier": "Aspect Build Inc"},
+    "buildifier_prebuilt": {"license": "Apache-2.0", "supplier": "The Bazel Authors"},
 }
 
 
 def apply_known_licenses(metadata: dict[str, Any]) -> None:
-    """Apply BCR known licenses and user license overrides to modules.
+    """Apply BCR known licenses, Eclipse S-CORE defaults, and user overrides to modules.
 
     Priority (highest to lowest):
     1. Module already has a license (skip).
     2. Exact match in metadata["licenses"] (user-declared via sbom_ext.license).
     3. Parent match in metadata["licenses"] (e.g., "boost" covers "boost.config").
-    4. BCR_KNOWN_LICENSES exact match.
-    5. BCR_KNOWN_LICENSES parent match (e.g., "boost" entry covers "boost.config").
+    4. S-CORE module default (Apache-2.0, Eclipse Foundation) for "score_*" modules.
+    5. BCR_KNOWN_LICENSES exact match.
+    6. BCR_KNOWN_LICENSES parent match (e.g., "boost" entry covers "boost.config").
 
     Args:
         metadata: Metadata dict with "modules" and "licenses" keys. Modified in place.
@@ -231,6 +287,9 @@ def apply_known_licenses(metadata: dict[str, Any]) -> None:
     licenses = metadata.get("licenses", {})
 
     for module_name, module_data in modules.items():
+        if module_name.startswith("score_") and not module_data.get("url"):
+            module_data["url"] = f"https://github.com/eclipse-score/{module_name}"
+
         if module_data.get("license"):
             continue  # Already has a license — do not overwrite
 
@@ -245,10 +304,17 @@ def apply_known_licenses(metadata: dict[str, Any]) -> None:
             if parent in licenses:
                 license_source = licenses[parent]
 
-        # 3. BCR known licenses — exact match
+        # 3. Eclipse S-CORE module defaults (Apache-2.0, Eclipse Foundation)
+        if license_source is None and module_name.startswith("score_"):
+            license_source = {
+                "license": "Apache-2.0",
+                "supplier": "Eclipse Foundation",
+            }
+
+        # 4. BCR known licenses — exact match
         if license_source is None and module_name in BCR_KNOWN_LICENSES:
             license_source = BCR_KNOWN_LICENSES[module_name]
-        # 4. BCR known licenses — parent prefix match (e.g. boost.config → boost)
+        # 5. BCR known licenses — parent prefix match (e.g. boost.config → boost)
         if license_source is None and "." in module_name:
             parent = module_name.split(".")[0]
             if parent in BCR_KNOWN_LICENSES:
@@ -258,6 +324,8 @@ def apply_known_licenses(metadata: dict[str, Any]) -> None:
             module_data["license"] = license_source["license"]
             if not module_data.get("supplier") and license_source.get("supplier"):
                 module_data["supplier"] = license_source["supplier"]
+            if not module_data.get("url") and license_source.get("url"):
+                module_data["url"] = license_source["url"]
 
 
 def normalize_name(name: str) -> str:
@@ -465,6 +533,16 @@ def main() -> int:
             # Don't override entries already in metadata (from the extension)
             if name not in metadata["modules"]:
                 metadata["modules"][name] = mod_data
+            else:
+                existing = metadata["modules"][name]
+                if existing.get("version") in ("unknown", "") and mod_data.get(
+                    "version"
+                ):
+                    existing["version"] = mod_data["version"]
+                if existing.get("purl", "").endswith("@unknown") and mod_data.get(
+                    "purl"
+                ):
+                    existing["purl"] = mod_data["purl"]
 
     # Parse MODULE.bazel.lock files to infer selected module versions.
     # This helps for modules that don't participate in the sbom_metadata
@@ -477,6 +555,24 @@ def main() -> int:
         for name, mod_data in lock_modules.items():
             if name not in metadata["modules"]:
                 metadata["modules"][name] = mod_data
+            else:
+                existing = metadata["modules"][name]
+                if existing.get("version") in ("unknown", "") and mod_data.get(
+                    "version"
+                ):
+                    existing["version"] = mod_data["version"]
+                if existing.get("purl", "").endswith("@unknown") and mod_data.get(
+                    "purl"
+                ):
+                    existing["purl"] = mod_data["purl"]
+                if not existing.get("sha256") and mod_data.get("sha256"):
+                    existing["sha256"] = mod_data["sha256"]
+                if not existing.get("license") and mod_data.get("license"):
+                    existing["license"] = mod_data["license"]
+                if not existing.get("supplier") and mod_data.get("supplier"):
+                    existing["supplier"] = mod_data["supplier"]
+                if not existing.get("url") and mod_data.get("url"):
+                    existing["url"] = mod_data["url"]
 
     # Load crates metadata cache (licenses + checksums + versions)
     crates_cache = load_crates_cache(args.crates_cache)
@@ -686,13 +782,23 @@ def resolve_component(
     modules = metadata.get("modules", {})
     if normalized_name in modules:
         mod = modules[normalized_name]
+        version = mod.get("version", "unknown")
+        purl = mod.get("purl", "")
+        if not purl or purl.endswith("@unknown"):
+            purl = (
+                f"pkg:github/eclipse-score/{normalized_name}@{version}"
+                if normalized_name.startswith("score_")
+                else f"pkg:generic/{normalized_name}@{version}"
+            )
         result: dict[str, Any] = {
             "name": normalized_name,
-            "version": mod.get("version", "unknown"),
-            "purl": mod.get("purl", f"pkg:generic/{normalized_name}@unknown"),
+            "version": version,
+            "purl": purl,
             "type": "library",
             "supplier": mod.get("supplier", ""),
             "license": mod.get("license", ""),
+            "url": mod.get("url", ""),
+            "description": mod.get("description", ""),
             "cpe": mod.get("cpe", ""),
             "aliases": mod.get("aliases", []),
             "pedigree_ancestors": mod.get("pedigree_ancestors", []),
@@ -704,6 +810,21 @@ def resolve_component(
         # checksum so CycloneDX hashes are populated for C/C++ modules.
         if mod.get("sha256"):
             result["checksum"] = mod["sha256"]
+        elif mod.get("checksum"):
+            result["checksum"] = mod["checksum"]
+
+        if normalized_name.startswith("score_"):
+            if not result.get("supplier"):
+                result["supplier"] = "Eclipse Foundation"
+            if not result.get("license"):
+                result["license"] = "Apache-2.0"
+            if not result.get("url"):
+                result["url"] = f"https://github.com/eclipse-score/{normalized_name}"
+            if result.get("purl", "").startswith(f"pkg:generic/{normalized_name}@"):
+                result["purl"] = (
+                    f"pkg:github/eclipse-score/{normalized_name}@{result['version']}"
+                )
+
         return result
 
     # Check if it's an http_archive dependency
@@ -791,7 +912,8 @@ def resolve_component(
             "purl": f"pkg:github/eclipse-score/{normalized_name}@unknown",
             "type": "library",
             "supplier": "Eclipse Foundation",
-            "license": "",
+            "license": "Apache-2.0",
+            "url": f"https://github.com/eclipse-score/{normalized_name}",
             "cpe": "",
             "aliases": [],
             "pedigree_ancestors": [],
